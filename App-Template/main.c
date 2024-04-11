@@ -1,157 +1,82 @@
-/**
- * RP2040 FreeRTOS Template
- * 
- * @copyright 2023, Tony Smith (@smittytone)
- * @version   1.4.2
- * @licence   MIT
- *
- */
+#include <stdio.h>
+#include "FreeRTOS.h"
+#include "task.h"
 #include "main.h"
+#include "semphr.h"
 
-
-/*
- * GLOBALS
- */
-// This is the inter-task queue
-volatile QueueHandle_t queue = NULL;
-
-// Set a delay time of exactly 500ms
-const TickType_t ms_delay = 500 / portTICK_PERIOD_MS;
-
-// FROM 1.0.1 Record references to the tasks
-TaskHandle_t gpio_task_handle = NULL;
-TaskHandle_t pico_task_handle = NULL;
-
-
-/*
- * FUNCTIONS
- */
-
-/**
- * @brief Repeatedly flash the Pico's built-in LED.
- */
-void led_task_pico(void* unused_arg) {
-
-    // Store the Pico LED state
-    uint8_t pico_led_state = 0;
+#define TIME_QUANTUM 1000  // 1000ms converted to ticks
+SemaphoreHandle_t semaphore;
+typedef struct {
+    char *taskName;
+    int totalRuntime;
+    int remainingTime;
+    int ledNum;
+    bool needsRestart; //1 means yes
     
-    // Configure the Pico's on-board LED
-    gpio_init(PICO_DEFAULT_LED_PIN);
-    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
-    
-    while (true) {
-        // Turn Pico LED on an add the LED state
-        // to the FreeRTOS xQUEUE
-        log_debug("PICO LED FLASH");
-        pico_led_state = 1;
-        gpio_put(PICO_DEFAULT_LED_PIN, pico_led_state);
-        xQueueSendToBack(queue, &pico_led_state, 0);
-        vTaskDelay(ms_delay);
-        
-        // Turn Pico LED off an add the LED state
-        // to the FreeRTOS xQUEUE
-        pico_led_state = 0;
-        gpio_put(PICO_DEFAULT_LED_PIN, pico_led_state);
-        xQueueSendToBack(queue, &pico_led_state, 0);
-        vTaskDelay(ms_delay);
+} TaskParameters;
+int numOfProcs = 4;
+// Task function prototype
+void vTaskCode(void *pvParameters);
+
+// Define task run times
+TaskParameters tasks[] = {
+    {"Task 1", 2500, 2500, 3, true},
+    {"Task 2", 3500, 3500, 7, true},
+    {"Task 3", 1500, 1500, 11, true},
+    {"Task 4", 2000, 2000, 15, true}
+};
+
+int main(void) {
+    // Initialize GPIO for each task/LED once
+    stdio_init_all();
+    for (int i = 0; i < sizeof(tasks)/sizeof(tasks[0]); i++) {
+        gpio_init(tasks[i].ledNum);
+        gpio_set_dir(tasks[i].ledNum, GPIO_OUT);
     }
+    // Create the semaphore before starting tasks
+    semaphore = xSemaphoreCreateBinary();
+    xSemaphoreGive(semaphore); // Give the semaphore to allow the first task to start
+
+    // Create tasks
+    for (int i = 0; i < sizeof(tasks)/sizeof(tasks[0]); i++) {
+        xTaskCreate(vTaskCode, tasks[i].taskName, 1000, (void *)&tasks[i], 1, NULL);
+    }
+
+    vTaskStartScheduler();
+    // Should never reach here
+    for (;;) {}
+
+    return 0;
 }
 
+// Task implementation
+void vTaskCode(void *pvParameters) {
+    TaskParameters *taskParams = (TaskParameters *)pvParameters;
 
-/**
- * @brief Repeatedly flash an LED connected to GPIO pin 20
- *        based on the value passed via the inter-task queue.
- */
-void led_task_gpio(void* unused_arg) {
+    while (taskParams->remainingTime > 0) {
+        if (xSemaphoreTake(semaphore, portMAX_DELAY) == pdTRUE) {
+            gpio_put(taskParams->ledNum, 1);
+            printf("%s is running, %dms remaining\n", taskParams->taskName, taskParams->remainingTime);
 
-    // This variable will take a copy of the value
-    // added to the FreeRTOS xQueue
-    uint8_t passed_value_buffer = 0;
-    
-    // Configure the GPIO LED
-    gpio_init(RED_LED_PIN);
-    gpio_set_dir(RED_LED_PIN, GPIO_OUT);
-    
-    while (true) {
-        // Check for an item in the FreeRTOS xQueue
-        if (xQueueReceive(queue, &passed_value_buffer, portMAX_DELAY) == pdPASS) {
-            // Received a value so flash the GPIO LED accordingly
-            // (NOT the sent value)
-            if (passed_value_buffer) log_debug("GPIO LED FLASH");
-            gpio_put(RED_LED_PIN, passed_value_buffer == 1 ? 0 : 1);
+            int timeToRun = taskParams->remainingTime < TIME_QUANTUM ? taskParams->remainingTime : TIME_QUANTUM;
+            vTaskDelay(pdMS_TO_TICKS(timeToRun));
+            taskParams->remainingTime -= timeToRun;
+
+            gpio_put(taskParams->ledNum, 0);
+            xSemaphoreGive(semaphore);
+            if (taskParams->remainingTime > 0) {
+                vTaskDelay(pdMS_TO_TICKS(TIME_QUANTUM));
+            }
+
+            // Give the semaphore back after each run, regardless of whether the task is finished
+            
+        }
+
+        // Check outside of semaphore take block to ensure that task can self-delete even if not acquiring semaphore
+        if (taskParams->remainingTime <= 0) {
+            printf("%s has finished execution.\n", taskParams->taskName);
+            vTaskDelete(NULL);  // End this task
         }
     }
-}
-
-
-/**
- * @brief Generate and print a debug message from a supplied string.
- *
- * @param msg: The base message to which `[DEBUG]` will be prefixed.
- */
-void log_debug(const char* msg) {
-
-#ifdef DEBUG
-    uint msg_length = 9 + strlen(msg);
-    char* sprintf_buffer = malloc(msg_length);
-    sprintf(sprintf_buffer, "[DEBUG] %s\n", msg);
-    printf("%s", sprintf_buffer);
-    free(sprintf_buffer);
-#endif
-}
-
-
-/**
- * @brief Show basic device info.
- */
-void log_device_info(void) {
-
-    printf("App: %s %s (%i)\n", APP_NAME, APP_VERSION, BUILD_NUM);
-}
-
-
-/*
- * RUNTIME START
- */
-int main() {
-
-    // Enable STDIO
-#ifdef DEBUG
-    stdio_usb_init();
-    // Pause to allow the USB path to initialize
-    sleep_ms(2000);
-
-    // Log app info
-    log_device_info();
-#endif
     
-    // Set up two tasks
-    // FROM 1.0.1 Store handles referencing the tasks; get return values
-    // NOTE Arg 3 is the stack depth -- in words, not bytes
-    BaseType_t pico_status = xTaskCreate(led_task_pico, 
-                                         "PICO_LED_TASK", 
-                                         128, 
-                                         NULL, 
-                                         1, 
-                                         &pico_task_handle);
-    BaseType_t gpio_status = xTaskCreate(led_task_gpio, 
-                                         "GPIO_LED_TASK", 
-                                         128, 
-                                         NULL, 
-                                         1, 
-                                         &gpio_task_handle);
-    
-    // Set up the event queue
-    queue = xQueueCreate(4, sizeof(uint8_t));
-
-    // Start the FreeRTOS scheduler
-    // FROM 1.0.1: Only proceed with valid tasks
-    if (pico_status == pdPASS || gpio_status == pdPASS) {
-        vTaskStartScheduler();
-    }
-    
-    // We should never get here, but just in case...
-    while(true) {
-        // NOP
-    };
 }

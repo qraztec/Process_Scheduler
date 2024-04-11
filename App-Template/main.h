@@ -45,6 +45,13 @@ void log_debug(const char* msg);
 void log_device_info(void);
 
 
+
+
+
+// Function prototype for task code
+void vTaskCode(void *pvParameters);
+
+
 #ifdef __cplusplus
 }           // extern "C"
 #endif
